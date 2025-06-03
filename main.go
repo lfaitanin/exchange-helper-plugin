@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -223,13 +224,13 @@ func findPublicTransport(property *PropertyInfo, client *maps.Client) error {
 	}
 
 	// Buscar estações de trem
-	trainStations, err := searchNearbyPlaces(client, location, "train_station", 2000)
+	trainStations, err := searchNearbyPlacesFn(client, location, "train_station", 2000)
 	if err != nil {
 		return err
 	}
 
 	// Buscar pontos de ônibus
-	busStops, err := searchNearbyPlaces(client, location, "bus_station", 1000)
+	busStops, err := searchNearbyPlacesFn(client, location, "bus_station", 1000)
 	if err != nil {
 		return err
 	}
@@ -239,9 +240,13 @@ func findPublicTransport(property *PropertyInfo, client *maps.Client) error {
 		dist := calculateDistance(location.Lat, location.Lng,
 			station.Geometry.Location.Lat, station.Geometry.Location.Lng)
 
+		tType := ""
+		if len(station.Types) > 0 {
+			tType = station.Types[0]
+		}
 		transport := POI{
 			Name:     station.Name,
-			Type:     station.Types[0],
+			Type:     tType,
 			Distance: dist,
 			Duration: int(dist * 1000 / 80), // Estimativa: 80m/min caminhando
 		}
@@ -285,7 +290,7 @@ func findAmenities(property *PropertyInfo, client *maps.Client) error {
 	}
 
 	for _, amenityType := range amenityTypes {
-		places, err := searchNearbyPlaces(client, location, amenityType, 1500)
+		places, err := searchNearbyPlacesFn(client, location, amenityType, 1500)
 		if err != nil {
 			log.Printf("Warning: error searching for %s: %v", amenityType, err)
 			continue
@@ -326,7 +331,7 @@ func findEntertainment(property *PropertyInfo, client *maps.Client) error {
 	}
 
 	for _, entType := range entertainmentTypes {
-		places, err := searchNearbyPlaces(client, location, entType, 2000)
+		places, err := searchNearbyPlacesFn(client, location, entType, 2000)
 		if err != nil {
 			log.Printf("Warning: error searching for %s: %v", entType, err)
 			continue
@@ -365,6 +370,9 @@ func searchNearbyPlaces(client *maps.Client, location *maps.LatLng, placeType st
 
 	return resp.Results, nil
 }
+
+// searchNearbyPlacesFn is a variable so tests can replace the search implementation
+var searchNearbyPlacesFn = searchNearbyPlaces
 
 // calculateWalkScore calcula o score de caminhabilidade
 func calculateWalkScore(property *PropertyInfo) {
@@ -640,13 +648,20 @@ func getPriceHistory(property *PropertyInfo) error {
 
 // extractPriceValue extrai o valor numérico de uma string de preço
 func extractPriceValue(price string) float64 {
-	// Remover símbolos de moeda e outros caracteres
+	// Remover símbolos de moeda e separadores
 	price = strings.TrimSpace(price)
 	price = strings.ReplaceAll(price, "€", "")
 	price = strings.ReplaceAll(price, ",", "")
-	price = strings.Split(price, " ")[0] // Pegar apenas o primeiro número
+	price = strings.ReplaceAll(price, " ", "")
 
-	value, err := strconv.ParseFloat(price, 64)
+	// Capturar apenas os dígitos iniciais (ignorando qualquer texto)
+	re := regexp.MustCompile(`^[0-9]+(?:\.[0-9]+)?`)
+	match := re.FindString(price)
+	if match == "" {
+		return 0
+	}
+
+	value, err := strconv.ParseFloat(match, 64)
 	if err != nil {
 		return 0
 	}

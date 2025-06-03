@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
@@ -137,7 +139,7 @@ func enrichPropertyInfo(property *PropertyInfo) error {
 
 // Obter coordenadas usando a API do Google Maps
 func getCoordinates(property *PropertyInfo) error {
-	apiKey := "AIzaSyBSIGbHuOHlsbXTtwKcDCXBRZ4B_LMf8Nw"
+	apiKey := os.Getenv("GOOGLE_MAPS_API_KEY")
 	if apiKey == "" {
 		return fmt.Errorf("GOOGLE_MAPS_API_KEY não definida")
 	}
@@ -176,10 +178,32 @@ func getCoordinates(property *PropertyInfo) error {
 
 // Obter informações de segurança
 func getSafetyInfo(property *PropertyInfo) error {
-	// TODO: Implementar usando:
-	// 1. Dados do Garda.ie para estatísticas de crime
-	// 2. OpenStreetMap para localização de estações Garda
-	// 3. Google Places API para informações adicionais
+	analysis := AnalysisResponse{Property: *property}
+
+	if err := findNearbyGardai(&analysis); err != nil {
+		return err
+	}
+	if err := analyzeStreetLighting(&analysis); err != nil {
+		return err
+	}
+	if err := getCrimeStats(&analysis); err != nil {
+		return err
+	}
+
+	calculateSafetyScore(&analysis)
+
+	property.SafetyInfo.CrimeRate = analysis.SafetyInfo.CrimeStats.PerCapita
+	property.SafetyInfo.SafetyRating = analysis.SafetyInfo.SafetyScore / 10
+	property.SafetyInfo.StreetLighting = analysis.SafetyInfo.StreetLighting.Description
+	for _, g := range analysis.SafetyInfo.NearbyGardai {
+		property.SafetyInfo.NearbyGardai = append(property.SafetyInfo.NearbyGardai, POI{
+			Name:     g.Name,
+			Type:     "garda_station",
+			Distance: g.Distance,
+			Duration: int(g.Distance * 1000 / 80),
+		})
+	}
+
 	return nil
 }
 
@@ -974,7 +998,7 @@ func analyzeSafety(analysis *AnalysisResponse) error {
 
 // findNearbyGardai encontra delegacias próximas usando Google Places API
 func findNearbyGardai(analysis *AnalysisResponse) error {
-	apiKey := "AIzaSyBSIGbHuOHlsbXTtwKcDCXBRZ4B_LMf8Nw"
+	apiKey := os.Getenv("GOOGLE_MAPS_API_KEY")
 	if apiKey == "" {
 		return fmt.Errorf("GOOGLE_MAPS_API_KEY not set")
 	}
@@ -1018,27 +1042,92 @@ func findNearbyGardai(analysis *AnalysisResponse) error {
 
 // analyzeStreetLighting analisa a iluminação pública usando OpenStreetMap
 func analyzeStreetLighting(analysis *AnalysisResponse) error {
-	// TODO: Implementar usando Overpass API do OpenStreetMap para contar postes de luz
-	// Por enquanto, vamos usar um valor padrão
-	analysis.SafetyInfo.StreetLighting.Rating = 7
-	analysis.SafetyInfo.StreetLighting.Description = "Good street lighting coverage"
+	query := fmt.Sprintf(`[out:json];node["highway"="street_lamp"](around:500,%f,%f);out count;`,
+		analysis.Property.Coordinates.Lat, analysis.Property.Coordinates.Lng)
+
+	resp, err := http.PostForm("https://overpass-api.de/api/interpreter",
+		url.Values{"data": {query}})
+	if err != nil {
+		return fmt.Errorf("error querying Overpass API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("overpass API returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Elements []struct {
+			Tags map[string]string `json:"tags"`
+		} `json:"elements"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("error decoding overpass response: %w", err)
+	}
+
+	count := 0
+	if len(result.Elements) > 0 {
+		if v, ok := result.Elements[0].Tags["nodes"]; ok {
+			count, _ = strconv.Atoi(v)
+		}
+	}
+
+	rating := 4
+	switch {
+	case count > 50:
+		rating = 10
+	case count > 20:
+		rating = 8
+	case count > 10:
+		rating = 6
+	}
+
+	analysis.SafetyInfo.StreetLighting.Rating = rating
+	analysis.SafetyInfo.StreetLighting.Description = fmt.Sprintf("%d street lights within 500m", count)
 	return nil
 }
 
 // getCrimeStats obtém estatísticas de crime da região
 func getCrimeStats(analysis *AnalysisResponse) error {
-	// TODO: Implementar usando dados do CSO.ie ou Garda.ie
-	// Por enquanto, vamos usar dados simulados
-	analysis.SafetyInfo.CrimeStats.Total = 245
-	analysis.SafetyInfo.CrimeStats.PerCapita = 0.023
-	analysis.SafetyInfo.CrimeStats.Breakdown = []struct {
-		Type  string `json:"type"`
-		Count int    `json:"count"`
-	}{
-		{"Theft", 89},
-		{"Public Order", 45},
-		{"Criminal Damage", 32},
+	apiURL := os.Getenv("CRIME_STATS_API_URL")
+	if apiURL == "" {
+		return fmt.Errorf("CRIME_STATS_API_URL not set")
 	}
+
+	url := fmt.Sprintf("%s?lat=%f&lng=%f", apiURL,
+		analysis.Property.Coordinates.Lat,
+		analysis.Property.Coordinates.Lng)
+
+	resp, err := http.Get(url)
+	if err != nil {
+		return fmt.Errorf("error calling crime stats API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("crime stats API returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var data struct {
+		Total     int     `json:"total"`
+		PerCapita float64 `json:"perCapita"`
+		Breakdown []struct {
+			Type  string `json:"type"`
+			Count int    `json:"count"`
+		} `json:"breakdown"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return fmt.Errorf("error decoding crime stats response: %w", err)
+	}
+
+	analysis.SafetyInfo.CrimeStats.Total = data.Total
+	analysis.SafetyInfo.CrimeStats.PerCapita = data.PerCapita
+	analysis.SafetyInfo.CrimeStats.Breakdown = data.Breakdown
+
 	return nil
 }
 

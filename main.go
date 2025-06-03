@@ -236,15 +236,7 @@ func findPublicTransport(property *PropertyInfo, client *maps.Client) error {
 
 	// Combinar resultados
 	for _, station := range append(trainStations, busStops...) {
-		dist := calculateDistance(location.Lat, location.Lng,
-			station.Geometry.Location.Lat, station.Geometry.Location.Lng)
-
-		transport := POI{
-			Name:     station.Name,
-			Type:     station.Types[0],
-			Distance: dist,
-			Duration: int(dist * 1000 / 80), // Estimativa: 80m/min caminhando
-		}
+		transport := stationToPOI(station, location)
 		property.QualityOfLife.PublicTransport = append(property.QualityOfLife.PublicTransport, transport)
 	}
 
@@ -364,6 +356,24 @@ func searchNearbyPlaces(client *maps.Client, location *maps.LatLng, placeType st
 	}
 
 	return resp.Results, nil
+}
+
+// stationToPOI converte um resultado do Google Places em um POI
+func stationToPOI(station maps.PlacesSearchResult, origin *maps.LatLng) POI {
+	dist := calculateDistance(origin.Lat, origin.Lng,
+		station.Geometry.Location.Lat, station.Geometry.Location.Lng)
+
+	tType := "unknown"
+	if len(station.Types) > 0 {
+		tType = station.Types[0]
+	}
+
+	return POI{
+		Name:     station.Name,
+		Type:     tType,
+		Distance: dist,
+		Duration: int(dist * 1000 / 80), // Estimativa: 80m/min caminhando
+	}
 }
 
 // calculateWalkScore calcula o score de caminhabilidade

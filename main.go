@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
+	"io/ioutil"
 	"log"
 	"math"
 	"net/http"
@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/gocolly/colly/v2"
 	"github.com/gocolly/colly/v2/debug"
@@ -468,96 +469,128 @@ func analyzeValue(property *PropertyInfo) error {
 	return nil
 }
 
-// findSimilarProperties encontra imóveis similares no Daft.ie
 func findSimilarProperties(property *PropertyInfo) error {
+	slugify := func(s string) string {
+		s = strings.ToLower(strings.ReplaceAll(s, " ", "-"))
+		var b strings.Builder
+		for _, r := range s {
+			if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '-' {
+				b.WriteRune(r)
+			}
+		}
+		return b.String()
+	}
+
+	// ---------- montar URL de busca ----------
+	basePrice := extractPriceValue(property.RentPrice)
+	minPrice := roundToNearest50(basePrice * 0.8)
+	maxPrice := roundToNearest50(basePrice * 1.2)
+
+	locSlug := slugify(extractLocationFromAddress(property.Address))
+	searchURL := fmt.Sprintf(
+		"https://www.daft.ie/sharing/%s?rentalPrice_from=%.0f&rentalPrice_to=%.0f",
+		locSlug, minPrice, maxPrice)
+
+	// ---------- colly ----------
 	c := colly.NewCollector(
 		colly.AllowedDomains("www.daft.ie", "daft.ie"),
 		colly.UserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
-		colly.AllowURLRevisit(),
 		colly.Debugger(&debug.LogDebugger{}),
 	)
 
-	// Configurar headers
+	// HEADERS
 	c.OnRequest(func(r *colly.Request) {
 		r.Headers.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
 		r.Headers.Set("Accept-Language", "en-US,en;q=0.5")
-		r.Headers.Set("Cache-Control", "no-cache")
-		r.Headers.Set("Pragma", "no-cache")
 		r.Headers.Set("DNT", "1")
-		r.Headers.Set("Connection", "keep-alive")
-		r.Headers.Set("Upgrade-Insecure-Requests", "1")
-		log.Printf("Fazendo requisição para buscar imóveis similares: %s", r.URL.String())
+		log.Printf("Buscando similares: %s", r.URL.String())
 	})
 
-	// Debug: Imprimir HTML antes do parsing
-	c.OnResponse(func(r *colly.Response) {
-		log.Printf("Status da busca: %d", r.StatusCode)
-		log.Printf("Content-Type: %s", r.Headers.Get("Content-Type"))
-		log.Printf("Body length: %d", len(r.Body))
-
-		// Salvar HTML para debug
-		err := r.Save("debug_similar_response.html")
-		if err != nil {
-			log.Printf("Erro ao salvar HTML: %v", err)
+	c.OnHTML("script#__NEXT_DATA__", func(e *colly.HTMLElement) {
+		type nextData struct {
+			Props struct {
+				PageProps struct {
+					Adverts []struct {
+						DisplayAddress string `json:"displayAddress"`
+						Price          struct {
+							Monthly int `json:"monthly"`
+							Weekly  int `json:"weekly"`
+						} `json:"price"`
+						AdPath string `json:"adPath"`
+					} `json:"adverts"`
+				} `json:"pageProps"`
+			} `json:"props"`
 		}
-	})
 
-	// Extrair dados dos imóveis similares
-	c.OnHTML("div[data-testid='results'] > ul > li", func(e *colly.HTMLElement) {
-		log.Printf("Encontrou um resultado")
+		var data nextData
+		if err := json.Unmarshal([]byte(e.Text), &data); err != nil {
+			log.Printf("Erro ao decodificar __NEXT_DATA__: %v", err)
+			return
+		}
 
-		price := e.ChildText("div[data-testid='price']")
-		address := e.ChildText("div[data-testid='address']")
-		url := e.ChildAttr("a[data-testid='link']", "href")
-
-		log.Printf("Dados encontrados - Preço: %s, Endereço: %s, URL: %s", price, address, url)
-
-		if price != "" && address != "" && url != "" {
-			// Converter preço para número
-			priceNum := extractPriceValue(price)
-
-			similar := SimilarProperty{
-				Address: address,
-				Price:   priceNum,
-				URL:     "https://www.daft.ie" + url,
+		for _, ad := range data.Props.PageProps.Adverts {
+			price := ad.Price.Monthly
+			if price == 0 {
+				price = ad.Price.Weekly
 			}
-			property.ValueAnalysis.Similar = append(property.ValueAnalysis.Similar, similar)
+			if price == 0 {
+				continue
+			}
+
+			property.ValueAnalysis.Similar = append(property.ValueAnalysis.Similar, SimilarProperty{
+				Address: ad.DisplayAddress,
+				Price:   float64(price),
+				URL:     "https://www.daft.ie" + ad.AdPath,
+			})
 		}
 	})
 
+	// ---------- 2) fallback simples caso JSON falhe ----------
+	c.OnHTML("li[data-testid^='result-']", func(e *colly.HTMLElement) {
+    // URL
+    href := e.ChildAttr("a[href^='/share/']", "href")
+    if href == "" {
+        return
+    }
+
+    // Endereço
+    address := strings.TrimSpace(
+        e.ChildText("div[data-tracking='srp_address'] p"))
+    if address == "" {
+        return
+    }
+
+    // Preço (ex.: "€650 per month")
+    priceTxt := strings.TrimSpace(
+        e.ChildText("div[data-tracking='srp_price'] p"))
+    price := extractPriceValue(priceTxt)
+    if price == 0 {
+        return
+    }
+
+    property.ValueAnalysis.Similar = append(
+        property.ValueAnalysis.Similar,
+        SimilarProperty{
+            Address: address,
+            Price:   price,
+            URL:     "https://www.daft.ie" + href,
+        })
+	})
+	// ---------- erro / resposta ----------
 	c.OnError(func(r *colly.Response, err error) {
-		log.Printf("Erro ao buscar imóveis similares: %v", err)
-		log.Printf("Status code: %d", r.StatusCode)
-		log.Printf("Headers: %v", r.Headers)
+		log.Printf("Erro ao buscar similares: status %d – %v", r.StatusCode, err)
 	})
 
-	// Construir URL de busca
-	basePrice := extractPriceValue(property.RentPrice)
-	minPrice := roundToNearest50(basePrice * 0.8) // 20% abaixo, arredondado para 50
-	maxPrice := roundToNearest50(basePrice * 1.2) // 20% acima, arredondado para 50
-
-	location := extractLocationFromAddress(property.Address)
-	log.Printf("Localização extraída: %s", location)
-
-	searchURL := fmt.Sprintf("https://www.daft.ie/sharing/%s?rentalPrice_from=%.0f&rentalPrice_to=%.0f",
-		location,
-		minPrice,
-		maxPrice)
-
-	log.Printf("URL de busca: %s", searchURL)
-
-	err := c.Visit(searchURL)
-	if err != nil {
+	if err := c.Visit(searchURL); err != nil {
 		return fmt.Errorf("error visiting search page: %w", err)
 	}
 
-	log.Printf("Imóveis similares encontrados: %d", len(property.ValueAnalysis.Similar))
-
-	// Limitar a 5 imóveis similares
+	// limitar a 5
 	if len(property.ValueAnalysis.Similar) > 5 {
 		property.ValueAnalysis.Similar = property.ValueAnalysis.Similar[:5]
 	}
 
+	log.Printf("Imóveis similares encontrados: %d", len(property.ValueAnalysis.Similar))
 	return nil
 }
 
@@ -693,55 +726,56 @@ func extractPriceValue(price string) float64 {
 }
 
 // extractLocationFromAddress extrai a localização principal do endereço
-func extractLocationFromAddress(address string) string {
-	// Remover vírgulas e dividir
-	parts := strings.Split(address, ",")
-
-	// Para endereços irlandeses, geralmente o formato é:
-	// "Local Name, City/Town, Co. County"
-	var city, county string
-
-	if len(parts) >= 3 {
-		// Pegar a cidade (geralmente o segundo elemento)
-		city = strings.TrimSpace(parts[1])
-
-		// Pegar o condado (último elemento)
-		county = strings.TrimSpace(parts[len(parts)-1])
-		county = strings.TrimPrefix(county, "Co.")
-		county = strings.TrimPrefix(county, "Co")
-		county = strings.TrimPrefix(county, "County")
-		county = strings.TrimSpace(county)
-
-		// Juntar cidade e condado
-		location := strings.ToLower(city + "-" + county)
-
-		// Limpar caracteres especiais
-		return strings.Map(func(r rune) rune {
-			if r >= 'a' && r <= 'z' || r == '-' {
-				return r
-			}
-			return -1
-		}, location)
+func extractLocationFromAddress(addr string) string {
+	parts := strings.Split(addr, ",")
+	for i := range parts {
+		parts[i] = strings.ToLower(strings.TrimSpace(parts[i]))
 	}
 
-	// Se não conseguir extrair cidade e condado, retornar apenas a cidade limpa
-	if len(parts) >= 2 {
-		city = strings.TrimSpace(parts[1])
-	} else {
-		city = strings.TrimSpace(parts[0])
-	}
-
-	return strings.Map(func(r rune) rune {
-		if r >= 'a' && r <= 'z' || r == '-' {
-			return r
+	// limpa vazios
+	filtered := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p != "" {
+			filtered = append(filtered, p)
 		}
-		return -1
-	}, strings.ToLower(city))
+	}
+	if len(filtered) == 0 {
+		return ""
+	}
+
+	// heurística: penúltimo = bairro/subúrbio, último = condado / "dublin X"
+	var suburb, county string
+	if len(filtered) >= 2 {
+		suburb = filtered[len(filtered)-2]
+	}
+	county = filtered[len(filtered)-1]
+
+	// remove prefixos "co.", "county"
+	county = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(county, "co."), "county"))
+
+	// se o condado tiver números (ex.: "dublin 9"), pega só a 1ª palavra (⇒ "dublin")
+	if idx := strings.IndexFunc(county, unicode.IsDigit); idx != -1 {
+		county = strings.Fields(county)[0]
+	}
+
+	// gera slug preservando letras e hífens (sem números)
+	return slugify(suburb) + "-" + slugify(county)
 }
 
 // roundToNearest50 arredonda um número para o múltiplo de 50 mais próximo
 func roundToNearest50(value float64) float64 {
 	return math.Round(value/50) * 50
+}
+
+func slugify(s string) string {
+	s = strings.ToLower(strings.TrimSpace(strings.ReplaceAll(s, " ", "-")))
+	var b strings.Builder
+	for _, r := range s {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '-' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // scrapeDaftProperty raspa os dados de um anúncio do Daft.ie
@@ -1053,7 +1087,7 @@ func analyzeStreetLighting(analysis *AnalysisResponse) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := ioutil.ReadAll(resp.Body)
 		return fmt.Errorf("overpass API returned %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -1091,43 +1125,39 @@ func analyzeStreetLighting(analysis *AnalysisResponse) error {
 
 // getCrimeStats obtém estatísticas de crime da região
 func getCrimeStats(analysis *AnalysisResponse) error {
-	apiURL := os.Getenv("CRIME_STATS_API_URL")
-	if apiURL == "" {
-		return fmt.Errorf("CRIME_STATS_API_URL not set")
-	}
-
-	url := fmt.Sprintf("%s?lat=%f&lng=%f", apiURL,
+	// 1. Consulta CSO
+	stats, err := GetCrimeStats(
 		analysis.Property.Coordinates.Lat,
-		analysis.Property.Coordinates.Lng)
-
-	resp, err := http.Get(url)
+		analysis.Property.Coordinates.Lng,
+	)
 	if err != nil {
-		return fmt.Errorf("error calling crime stats API: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("crime stats API returned %d: %s", resp.StatusCode, string(body))
+		return fmt.Errorf("error getting crime stats: %w", err)
 	}
 
-	var data struct {
-		Total     int     `json:"total"`
-		PerCapita float64 `json:"perCapita"`
-		Breakdown []struct {
+	// 2. Copia total e per-capita
+	analysis.SafetyInfo.CrimeStats.Total = stats.Total
+	analysis.SafetyInfo.CrimeStats.PerCapita = stats.PerCapita
+
+	// 3. Converte []CrimeTypeData → slice anônimo esperado pelo JSON
+	if len(stats.Breakdown) == 0 {
+		analysis.SafetyInfo.CrimeStats.Breakdown = []struct {
 			Type  string `json:"type"`
 			Count int    `json:"count"`
-		} `json:"breakdown"`
+		}{}
+		return nil
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return fmt.Errorf("error decoding crime stats response: %w", err)
+	converted := make([]struct {
+		Type  string `json:"type"`
+		Count int    `json:"count"`
+	}, len(stats.Breakdown))
+
+	for i, ct := range stats.Breakdown {
+		converted[i].Type = ct.Type
+		converted[i].Count = ct.Count
 	}
 
-	analysis.SafetyInfo.CrimeStats.Total = data.Total
-	analysis.SafetyInfo.CrimeStats.PerCapita = data.PerCapita
-	analysis.SafetyInfo.CrimeStats.Breakdown = data.Breakdown
-
+	analysis.SafetyInfo.CrimeStats.Breakdown = converted
 	return nil
 }
 
@@ -1167,21 +1197,6 @@ func calculateSafetyScore(analysis *AnalysisResponse) {
 	}
 
 	analysis.SafetyInfo.SafetyScore = score
-}
-
-// calculateDistance calcula a distância em km entre dois pontos usando a fórmula de Haversine
-func calculateDistance(lat1, lon1, lat2, lon2 float64) float64 {
-	const R = 6371 // Raio da Terra em km
-
-	dLat := (lat2 - lat1) * math.Pi / 180
-	dLon := (lon2 - lon1) * math.Pi / 180
-	lat1 = lat1 * math.Pi / 180
-	lat2 = lat2 * math.Pi / 180
-
-	a := math.Sin(dLat/2)*math.Sin(dLat/2) +
-		math.Sin(dLon/2)*math.Sin(dLon/2)*math.Cos(lat1)*math.Cos(lat2)
-	c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
-	return R * c
 }
 
 func init() {
